@@ -1,0 +1,125 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ===== User payloads ===== */
+#define PASSWORD  0xF0
+#define CMD_FWD   0x01
+#define CMD_REV   0x02
+#define CMD_RHT   0x03
+#define CMD_LFT   0x04
+
+/* ===== Bit timing (SMCLK = 1 MHz) =====
+ * 2400 baud -> 1e6 / 2400 ≈ 416.67 cycles
+ */
+#define BIT_TIME  417u
+
+/* ===== Buttons (Port 2), all active-LOW with pull-ups =====
+ * Wire: P2.x ---- Button ---- GND
+ */
+#define BTN1      BIT0   /* P2.0 -> Forward  */
+#define BTN2      BIT5   /* P2.5 -> Reverse  */
+#define BTN3      BIT6   /* P2.6 -> Right    */
+#define BTN4      BIT7   /* P2.7 -> Left     */
+
+/* ===== IR carrier on TB0.5 -> P2.1 ===== */
+static inline void carrier_on(void)  { TB0CCTL5 = OUTMOD_7; }   // Enable PWM (Reset/Set)
+static inline void carrier_off(void) { TB0CCTL5 = OUTMOD_0; }   // Disable PWM (OUT=0)
+
+/* ---- Low-level bit send: 0 = carrier ON, 1 = carrier OFF ---- */
+static void ir_send_bit(uint8_t b)
+{
+    if (b == 0) carrier_on(); else carrier_off();
+    __delay_cycles(BIT_TIME);
+}
+
+/* ---- UART-like byte: start(0), 8 data bits LSB-first, stop(1) ---- */
+static void ir_send_byte(uint8_t x)
+{
+    uint8_t i;
+    ir_send_bit(0);                  /* start bit */
+    for (i = 0; i < 8; i++) {
+        ir_send_bit(x & 0x01);
+        x >>= 1;
+    }
+    ir_send_bit(1);                  /* stop bit (idle = carrier OFF) */
+}
+
+/* ---- 2-byte packet: PASSWORD then command ---- */
+static void ir_send_packet(uint8_t cmd)
+{
+    ir_send_byte(PASSWORD);
+    ir_send_byte(cmd);
+    carrier_off();
+}
+
+/* ---- Debounce helper: active-LOW (pressed when P2.x reads 0) ---- */
+static uint8_t btn_is_pressed(uint8_t bitmask)
+{
+    if ((P2IN & bitmask) == 0) {         // LOW = pressed
+        __delay_cycles(5000);            // ~5 ms debounce
+        return ((P2IN & bitmask) == 0) ? 1u : 0u;
+    }
+    return 0u;
+}
+
+/* ---- Init one P2.x as GPIO input + pull-up ---- */
+static void setup_btn(uint8_t bitmask)
+{
+    P2SEL0 &= ~bitmask;   // GPIO
+    P2SEL1 &= ~bitmask;
+    P2DIR  &= ~bitmask;   // input
+    P2REN  |=  bitmask;   // enable resistor
+    P2OUT  |=  bitmask;   // pull-up -> idle HIGH
+}
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;                   // Stop watchdog
+    PM5CTL0 &= ~LOCKLPM5;                       // Unlock GPIOs
+
+    /* DCO ~1 MHz for stable BIT_TIME */
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_0;                       // ~1 MHz
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
+
+    /* IR output: P2.1 = TB0.5 (38 kHz PWM) */
+    P2DIR  |= BIT1;
+    P2SEL0 &= ~BIT1;
+    P2SEL1 |=  BIT1;
+
+    TB0CCR0  = 26 - 1;                          // ~38.46 kHz period
+    TB0CCR5  = 8;                               // ~33% duty
+    TB0CCTL5 = OUTMOD_0;                        // start OFF
+    TB0CTL   = TBSSEL__SMCLK | MC__UP | TBCLR;
+
+    /* Buttons setup (active-LOW, internal pull-ups) */
+    setup_btn(BTN1);    // P2.0 -> Forward
+    setup_btn(BTN2);    // P2.5 -> Reverse
+    setup_btn(BTN3);    // P2.6 -> Right
+    setup_btn(BTN4);    // P2.7 -> Left
+
+    __delay_cycles(1000);                       // settle
+
+    while (1)
+    {
+        /* Priority if multiple pressed: BTN1 > BTN2 > BTN3 > BTN4 */
+        if (btn_is_pressed(BTN1)) {
+            ir_send_packet(CMD_FWD);
+            __delay_cycles(50000);              // ~50 ms between bursts
+        } else if (btn_is_pressed(BTN2)) {
+            ir_send_packet(CMD_REV);
+            __delay_cycles(50000);
+        } else if (btn_is_pressed(BTN3)) {
+            ir_send_packet(CMD_RHT);
+            __delay_cycles(50000);
+        } else if (btn_is_pressed(BTN4)) {
+            ir_send_packet(CMD_LFT);
+            __delay_cycles(50000);
+        } else {
+            carrier_off();
+            __delay_cycles(2000);               // idle wait to reduce CPU load
+        }
+    }
+}

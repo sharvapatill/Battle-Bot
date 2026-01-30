@@ -1,0 +1,297 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* === Payloads === */
+#define PASSWORD   0xF0
+#define CMD_FWD    0x01
+#define CMD_REV    0x02
+#define CMD_RHT    0x03     /* right turn ~45° (timed, no PWM) */
+#define CMD_LFT    0x04     /* left  turn ~45° (timed, no PWM) */
+#define CMD_ATK    0x05     /* attack mechanism */
+
+/* === Pins === */
+#define ENA     BIT6    // P2.6 -> TB0.5 (left PWM)
+#define ENB     BIT7    // P2.7 -> TB0.6 (right PWM)
+#define IR_IN   BIT1    // P2.1 -> TSOP receiver
+#define ATK_PIN BIT2    // P2.2 -> Attack MOSFET gate
+
+#define IN1     BIT0    // P3.0
+#define IN2     BIT1    // P3.1
+#define IN3     BIT2    // P3.2
+#define IN4     BIT3    // P3.3
+
+/* === Timing @ 1 MHz === */
+#define BIT_TIME        417u
+#define HALF_BIT_TIME   (BIT_TIME/2 + 12)
+#define OFF_TIMEOUT_CYCLES  50000u          /* ~50 ms auto-stop (PWM modes) */
+#define PWM_PERIOD_COUNTS   (50u)
+#define PWM_DUTY_FWD        (25u)
+
+/* === Timed pivots (no PWM) === */
+#define TURN_RIGHT_45_MS    500u
+#define TURN_LEFT_45_MS     500u
+
+/* --- Action state for timed maneuvers --- */
+typedef enum {
+    ACT_IDLE = 0,
+    ACT_TURN_R45,
+    ACT_TURN_L45,
+    ACT_DONE
+} action_t;
+
+volatile action_t g_action = ACT_IDLE;
+volatile uint16_t g_ms = 0;                 
+volatile uint16_t g_last_match_time = 0;    
+
+/* ---------- IR helpers ---------- */
+static uint8_t wait_for_start_with_timeout(uint16_t timeout_cycles) {
+    uint16_t t0 = TA0R, now, dt;
+    while ((P2IN & IR_IN) == 0) {
+        now = TA0R; dt = (uint16_t)(now - t0);
+        if (dt >= timeout_cycles) return 0;
+    }
+    t0 = TA0R;
+    while ((P2IN & IR_IN) != 0) {
+        now = TA0R; dt = (uint16_t)(now - t0);
+        if (dt >= timeout_cycles) return 0;
+    }
+    return 1;
+}
+
+static uint8_t read_ir_byte(uint8_t *val) {
+    uint8_t i, b, bit_is_one, stop_high;
+    b = 0;
+
+    __delay_cycles(BIT_TIME + HALF_BIT_TIME);
+    for (i = 0; i < 8; i++) {
+        bit_is_one = (P2IN & IR_IN) ? 1u : 0u;
+        b >>= 1;
+        if (bit_is_one) b |= 0x80;
+        __delay_cycles(BIT_TIME);
+    }
+    stop_high = (P2IN & IR_IN) ? 1u : 0u;
+    if (!stop_high) return 0;
+
+    *val = b;
+    return 1;
+}
+
+/* ---------- Motor control (PWM modes) ---------- */
+static void motors_gpio_init(void) {
+    P3SEL0 &= ~(IN1|IN2|IN3|IN4);
+    P3SEL1 &= ~(IN1|IN2|IN3|IN4);
+    P3DIR  |=  (IN1|IN2|IN3|IN4);
+    P3OUT  &= ~(IN1|IN2|IN3|IN4);
+}
+
+static void pwm_attach_EN(void) {
+    P2SEL0 |=  (ENA | ENB);
+    P2SEL1 &= ~(ENA | ENB);
+    P2DIR  |=  (ENA | ENB);
+}
+
+static void pwm_detach_EN(void) {
+    P2SEL0 &= ~(ENA | ENB);
+    P2SEL1 &= ~(ENA | ENB);
+    P2DIR  |=  (ENA | ENB);
+}
+
+static void motors_pwm_init(void) {
+    pwm_attach_EN();
+    TB0CCR0  = PWM_PERIOD_COUNTS - 1;
+    TB0CCTL5 = OUTMOD_7;
+    TB0CCTL6 = OUTMOD_7;
+    TB0CCR5  = 0;
+    TB0CCR6  = 0;
+    TB0CTL   = TBSSEL__SMCLK | MC__UP | TBCLR;
+}
+
+static void motors_forward_pwm(uint16_t duty_counts) {
+    if (duty_counts >= PWM_PERIOD_COUNTS) duty_counts = PWM_PERIOD_COUNTS - 1;
+    P3OUT |=  (IN1 | IN3);
+    P3OUT &= ~(IN2 | IN4);
+    TB0CCR5 = duty_counts;
+    TB0CCR6 = duty_counts;
+}
+
+static void motors_reverse_pwm(uint16_t duty_counts) {
+    if (duty_counts >= PWM_PERIOD_COUNTS) duty_counts = PWM_PERIOD_COUNTS - 1;
+    P3OUT |=  (IN2 | IN4);
+    P3OUT &= ~(IN1 | IN3);
+    TB0CCR5 = duty_counts;
+    TB0CCR6 = duty_counts;
+}
+
+static void motors_stop_pwm(void) {
+    TB0CCR5 = 0;
+    TB0CCR6 = 0;
+}
+
+/* ---------- Motor control (timed pivots) ---------- */
+static void en_gpio_on(void)  { P2OUT |=  (ENA | ENB); }
+static void en_gpio_off(void) { P2OUT &= ~(ENA | ENB); }
+
+static void motors_turn_right_gpio(void) {
+    P3OUT |=  IN1;  P3OUT &= ~IN2;
+    P3OUT &= ~IN3;  P3OUT |=  IN4;
+    en_gpio_on();
+}
+
+static void motors_turn_left_gpio(void) {
+    P3OUT &= ~IN1;  P3OUT |=  IN2;
+    P3OUT |=  IN3;  P3OUT &= ~IN4;
+    en_gpio_on();
+}
+
+static void motors_all_off_gpio(void) {
+    en_gpio_off();
+    P3OUT &= ~(IN1 | IN2 | IN3 | IN4);
+}
+
+/* ---------- Attack Motor Control (P2.2 -> MOSFET) ---------- */
+static void attack_motor_init(void) {
+    P2DIR |= ATK_PIN;
+    P2OUT &= ~ATK_PIN;
+}
+
+static void attack_motor_on(void) {
+    P2OUT |= ATK_PIN;
+}
+
+static void attack_motor_off(void) {
+    P2OUT &= ~ATK_PIN;
+}
+
+/* ---------- main ---------- */
+int main(void) {
+    uint8_t ok, b1, b2;
+    uint16_t now, dt;
+
+    WDTCTL   = WDTPW | WDTHOLD;
+    PM5CTL0 &= ~LOCKLPM5;
+
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_0;
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
+
+    /* TA0 for timing */
+    TA0CTL = TASSEL__SMCLK | MC__CONTINUOUS | TACLR;
+
+    /* TA1 for timed pivots */
+    TA1CCR0  = 1000 - 1;
+    TA1CCTL0 = CCIE;
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+
+    /* IR input */
+    P2DIR  &= ~IR_IN;
+    P2REN  &= ~IR_IN;
+    P2SEL0 &= ~IR_IN;
+    P2SEL1 &= ~IR_IN;
+
+    motors_gpio_init();
+    motors_pwm_init();
+    attack_motor_init();
+    motors_stop_pwm();
+    attack_motor_off();
+
+    g_action = ACT_IDLE;
+    g_ms = 0;
+    g_last_match_time = TA0R;
+
+    for (;;) {
+        if (g_action == ACT_IDLE) {
+
+            /* Silence auto-stop */
+            now = TA0R;
+            dt  = (uint16_t)(now - g_last_match_time);
+            if (dt >= OFF_TIMEOUT_CYCLES) {
+                motors_stop_pwm();
+                attack_motor_off();
+            }
+
+            /* Decode bytes */
+            ok = wait_for_start_with_timeout(60000u);
+            if (!ok) continue;
+
+            ok = read_ir_byte(&b1);
+            if (!ok) { motors_stop_pwm(); attack_motor_off(); continue; }
+
+            ok = wait_for_start_with_timeout((uint16_t)(2u * BIT_TIME));
+            if (!ok) { motors_stop_pwm(); attack_motor_off(); continue; }
+
+            ok = read_ir_byte(&b2);
+            if (!ok) { motors_stop_pwm(); attack_motor_off(); continue; }
+
+            /* Process commands */
+            if (b1 == PASSWORD && b2 == CMD_FWD) {
+                motors_forward_pwm(PWM_DUTY_FWD);
+                g_last_match_time = TA0R;
+
+            } else if (b1 == PASSWORD && b2 == CMD_REV) {
+                motors_reverse_pwm(PWM_DUTY_FWD);
+                g_last_match_time = TA0R;
+
+            } else if (b1 == PASSWORD && b2 == CMD_RHT) {
+                motors_stop_pwm();
+                attack_motor_off();
+                pwm_detach_EN();
+                g_ms     = 0;
+                g_action = ACT_TURN_R45;
+                motors_turn_right_gpio();
+
+            } else if (b1 == PASSWORD && b2 == CMD_LFT) {
+                motors_stop_pwm();
+                attack_motor_off();
+                pwm_detach_EN();
+                g_ms     = 0;
+                g_action = ACT_TURN_L45;
+                motors_turn_left_gpio();
+
+            } else if (b1 == PASSWORD && b2 == CMD_ATK) {
+                /* Attack button held -> blade ON */
+                attack_motor_on();
+                g_last_match_time = TA0R;
+            }
+
+            __low_power_mode_0();
+        } 
+        else {
+            __low_power_mode_0();
+        }
+    }
+}
+
+/* ---------- Timer1 ISR: 1 ms tick ---------- */
+#pragma vector = TIMER1_A0_VECTOR
+__interrupt void Timer1_A0_ISR(void) {
+
+    if (g_action == ACT_TURN_R45) {
+        g_ms++;
+        if (g_ms >= TURN_RIGHT_45_MS) {
+            motors_all_off_gpio();
+            attack_motor_off();
+            pwm_attach_EN();
+            g_action = ACT_DONE;
+            g_ms = 0;
+        }
+    }
+
+    else if (g_action == ACT_TURN_L45) {
+        g_ms++;
+        if (g_ms >= TURN_LEFT_45_MS) {
+            motors_all_off_gpio();
+            attack_motor_off();
+            pwm_attach_EN();
+            g_action = ACT_DONE;
+            g_ms = 0;
+        }
+    }
+
+    else if (g_action == ACT_DONE) {
+        g_action = ACT_IDLE;
+    }
+
+    __bic_SR_register_on_exit(LPM0_bits);
+}
